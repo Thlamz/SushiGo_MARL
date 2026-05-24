@@ -3,7 +3,7 @@ import numpy as np
 from pettingzoo.test import parallel_api_test
 from SushiGo_env.sushi_go_env import (
     SushiGoParallelEnv, TEMPURA, SASHIMI, DUMPLING, NIGIRI_EGG, NIGIRI_SALMON,
-    NIGIRI_SQUID, WASABI, N_TYPES,
+    NIGIRI_SQUID, WASABI, N_TYPES, OBS_COMPONENTS, PADDING_VALUE,
 )
 
 
@@ -59,13 +59,16 @@ def test_observation_layout():
         e = SushiGoParallelEnv(n_players=n)
         obs, _ = e.reset(seed=0)
         o = obs["player_0"]
-        assert o["observation"].shape[0] == e.obs_dim
+        for key in OBS_COMPONENTS:
+            assert o[key].shape == e.obs_shapes[key]
+        flat = e.flatten_observation(o)
+        assert flat.shape[0] == e.obs_dim
         assert o["action_mask"].shape[0] == N_TYPES and o["action_mask"].sum() >= 1
-        sec = e.split_observation(o["observation"])
+        sec = e.split_observation(flat)
         # current_hand counts must equal hand_size at the start of a round
         assert sec["current_hand"].sum() == e.hand_size
-        # hand_history starts empty (all zeros) at the start of a round
-        assert sec["hand_history"].sum() == 0
+        # hand_history starts padded at the start of a round
+        assert np.all(sec["hand_history"] == PADDING_VALUE)
         # the action mask matches the current_hand section
         assert np.array_equal((sec["current_hand"] > 0).astype(np.int8), o["action_mask"])
     print("observation layout OK      -> obs_dim 2p/3p/4p =",
@@ -83,11 +86,12 @@ def test_stochastic_player_count_reset():
         assert e.player_mask.tolist() == [i < e.active_n_players for i in range(4)]
         for i, agent in enumerate(e.possible_agents):
             o = obs[agent]
-            assert o["observation"].shape[0] == e.obs_dim
+            assert e.flatten_observation(o).shape[0] == e.obs_dim
             assert bool(o["player_mask"]) is (i < e.active_n_players)
             assert o["action_mask"].sum() >= 1
             if i >= e.active_n_players:
-                assert np.all(o["observation"] == -1.0)
+                for key in OBS_COMPONENTS:
+                    assert np.all(o[key] == PADDING_VALUE)
                 assert o["action_mask"][0] == 1 and o["action_mask"].sum() == 1
     assert seen_counts <= {2, 3, 4}
     assert len(seen_counts) > 1
@@ -100,21 +104,19 @@ def test_hand_history_memory():
     obs, _ = e.reset(seed=42)
 
     # Hand player_0 is holding right now (turn 1).
-    hand_t1 = e.split_observation(obs["player_0"]["observation"])["current_hand"].copy()
+    hand_t1 = obs["player_0"]["current_hand"].copy()
 
     # Everyone drafts a legal card; advance one turn.
     acts = {a: int(np.flatnonzero(obs[a]["action_mask"])[0]) for a in e.agents}
     obs, *_ = e.step(acts)
 
-    sec = e.split_observation(obs["player_0"]["observation"])
-    slot0 = sec["hand_history"][:N_TYPES]          # most-recent remembered hand
+    slot0 = obs["player_0"]["hand_history"][0]          # most-recent remembered hand
     assert np.array_equal(slot0, hand_t1), (slot0, hand_t1)
 
     # Advance again: the turn-1 hand shifts to slot 1 (now 2 drafts stale).
     acts = {a: int(np.flatnonzero(obs[a]["action_mask"])[0]) for a in e.agents}
     obs, *_ = e.step(acts)
-    sec = e.split_observation(obs["player_0"]["observation"])
-    slot1 = sec["hand_history"][N_TYPES:2 * N_TYPES]
+    slot1 = obs["player_0"]["hand_history"][1]
     assert np.array_equal(slot1, hand_t1), (slot1, hand_t1)
     print("hand-history memory OK     -> remembered hand shifts down the buffer")
 
@@ -127,8 +129,7 @@ def test_history_resets_each_round():
         acts = {a: int(np.flatnonzero(obs[a]["action_mask"])[0]) for a in e.agents}
         obs, *_ = e.step(acts)
     # New round dealt: hand-history memory must be cleared.
-    sec = e.split_observation(obs["player_0"]["observation"])
-    assert sec["hand_history"].sum() == 0
+    assert np.all(obs["player_0"]["hand_history"] == PADDING_VALUE)
     assert e.round_idx == 2
     print("history resets each round  -> memory cleared on new deal")
 
