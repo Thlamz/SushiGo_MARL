@@ -46,6 +46,7 @@ from torchrl.modules import EGreedyModule, MultiAgentMLP, QValueModule
 from torchrl.objectives import DQNLoss, SoftUpdate, ValueEstimators
 
 from SushiGo_env.sushi_go_env import N_TYPES
+from SushiGo_env.encoder_adapter import build_encoder_qvalue_actor
 from SushiGo_env.torchrl_integration import (
     make_observation_flattener,
     make_torchrl_env,
@@ -66,13 +67,21 @@ CHOSEN_VALUE_KEY = (GROUP, "chosen_action_value")   # Q of the action actually t
 NUM_WORKERS = 4 
 
 
-def build_qvalue_actor(n_players, obs_dim, num_cells=128, depth=2, device="cpu"):
-    """Shared-parameter multi-agent Q-network + masked argmax head.
+def build_qvalue_selector():
+    """Build the masked argmax head shared by baseline and encoder DQN paths."""
+    # QValueModule turns Q-values into a (masked) greedy action. The action_mask_key
+    # makes it exclude cards not in hand BEFORE the argmax — for both the acting
+    # policy and, inside DQNLoss, the bootstrap target.
+    return QValueModule(
+        action_space="categorical", #  means it outputs an integer index
+        action_value_key=ACTION_VALUE_KEY,
+        action_mask_key=MASK_KEY,
+        out_keys=[ACTION_KEY, ACTION_VALUE_KEY, CHOSEN_VALUE_KEY],
+    )
 
-    The first module flattens the structured observation leaves into `OBS_KEY`.
-    The MLP then runs independently on each dense player slot with shared
-    parameters, and `QValueModule` applies the card-type `action_mask`.
-    """
+
+def build_mlp_qvalue_actor(n_players, obs_dim, num_cells=128, depth=2, device="cpu"):
+    """Baseline shared-parameter Q-network over flattened structured observations."""
     q_net = MultiAgentMLP(
         n_agent_inputs=obs_dim,
         n_agent_outputs=N_TYPES,      # one Q-value per card type
@@ -85,17 +94,33 @@ def build_qvalue_actor(n_players, obs_dim, num_cells=128, depth=2, device="cpu")
         device=device,
     )
     q_module = TensorDictModule(q_net, in_keys=[OBS_KEY], out_keys=[ACTION_VALUE_KEY])
+    return TensorDictSequential(make_observation_flattener(), q_module, build_qvalue_selector())
 
-    # QValueModule turns Q-values into a (masked) greedy action. The action_mask_key
-    # makes it exclude cards not in hand BEFORE the argmax — for both the acting
-    # policy and, inside DQNLoss, the bootstrap target.
-    qvalue_module = QValueModule(
-        action_space="categorical", #  means it outputs an integer index
-        action_value_key=ACTION_VALUE_KEY,
-        action_mask_key=MASK_KEY,
-        out_keys=[ACTION_KEY, ACTION_VALUE_KEY, CHOSEN_VALUE_KEY],
+
+def build_qvalue_actor(env, n_players, obs_dim, args, device="cpu"):
+    """Build the selected DQN architecture.
+
+    Baseline mode flattens structured observations before an MLP. Encoder mode
+    keeps sequential leaves structured, encodes them with the vendored transformer
+    module, then applies a small Q-head.
+    """
+    if args.use_encoder:
+        return build_encoder_qvalue_actor(
+            env,
+            n_agents=n_players,
+            qvalue_module=build_qvalue_selector(),
+            encoder_output_dim=args.encoder_output_dim,
+            q_head_cells=args.encoder_q_cells,
+            q_head_depth=args.encoder_q_depth,
+            device=device,
+        )
+    return build_mlp_qvalue_actor(
+        n_players,
+        obs_dim,
+        num_cells=args.mlp_cells,
+        depth=args.mlp_depth,
+        device=device,
     )
-    return TensorDictSequential(make_observation_flattener(), q_module, qvalue_module)
 
 
 def resolve_player_config(args):
@@ -147,7 +172,8 @@ def train(args):
         f"n_players={n_players}" if n_players is not None
         else f"n_players=[{min_n_players}, {max_n_players}]"
     )
-    print(f"device={device}  {player_msg}  total_frames={total_frames}")
+    model_msg = "encoder+DQN" if args.use_encoder else "MLP+DQN"
+    print(f"device={device}  {player_msg}  model={model_msg}  total_frames={total_frames}")
 
     # environment  
     env = make_torchrl_env(
@@ -162,7 +188,7 @@ def train(args):
 
     # Q-network. In stochastic mode this is sized for max_n_players; inactive
     # slots are still forwarded, but their losses are masked out below.
-    qvalue_actor = build_qvalue_actor(model_n_players, obs_dim, device=device)
+    qvalue_actor = build_qvalue_actor(env, model_n_players, obs_dim, args, device=device)
     qvalue_actor(env.reset())  # warm up lazy parameters with a real observation
     # It must happen before you build the optimizer or the loss, because those need real parameters to attach to.
 
@@ -286,6 +312,12 @@ def get_args():
     p.add_argument("--reward-scale", type=float, default=0.1)
     p.add_argument("--cuda", action="store_true")
     p.add_argument("--smoke", action="store_true", help="tiny wiring-check run")
+    p.add_argument("--use-encoder", action="store_true", help="use transformer encoder before the DQN Q-head")
+    p.add_argument("--mlp-cells", type=int, default=128)
+    p.add_argument("--mlp-depth", type=int, default=2)
+    p.add_argument("--encoder-output-dim", type=int, default=128)
+    p.add_argument("--encoder-q-cells", type=int, default=128)
+    p.add_argument("--encoder-q-depth", type=int, default=1)
     p.add_argument("--save-path", type=str, default="sushi_go_qnet_2_players.pt")
     return p.parse_args()
 
