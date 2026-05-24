@@ -1,7 +1,7 @@
 """Sanity checks: scoring rules, PettingZoo API compliance, hand-history memory."""
 import numpy as np
 from pettingzoo.test import parallel_api_test
-from Dev.src.SushiGo.sushi_go_env import (
+from SushiGo_env.sushi_go_env import (
     SushiGoParallelEnv, TEMPURA, SASHIMI, DUMPLING, NIGIRI_EGG, NIGIRI_SALMON,
     NIGIRI_SQUID, WASABI, N_TYPES,
 )
@@ -72,6 +72,28 @@ def test_observation_layout():
           [SushiGoParallelEnv(n_players=n).obs_dim for n in (2, 3, 4)])
 
 
+def test_stochastic_player_count_reset():
+    e = SushiGoParallelEnv(n_players=None, min_n_players=2, max_n_players=4)
+    seen_counts = set()
+    for seed in range(20):
+        obs, _ = e.reset(seed=seed)
+        seen_counts.add(e.active_n_players)
+        assert len(e.possible_agents) == 4
+        assert len(e.agents) == 4
+        assert e.player_mask.tolist() == [i < e.active_n_players for i in range(4)]
+        for i, agent in enumerate(e.possible_agents):
+            o = obs[agent]
+            assert o["observation"].shape[0] == e.obs_dim
+            assert bool(o["player_mask"]) is (i < e.active_n_players)
+            assert o["action_mask"].sum() >= 1
+            if i >= e.active_n_players:
+                assert np.all(o["observation"] == -1.0)
+                assert o["action_mask"][0] == 1 and o["action_mask"].sum() == 1
+    assert seen_counts <= {2, 3, 4}
+    assert len(seen_counts) > 1
+    print("stochastic reset OK        -> sampled counts =", sorted(seen_counts))
+
+
 def test_hand_history_memory():
     """history slot 0 must equal the hand the player held on the previous turn."""
     e = SushiGoParallelEnv(n_players=3)
@@ -123,6 +145,7 @@ if __name__ == "__main__":
     test_pudding_scoring()
     test_wasabi_ordering()
     test_observation_layout()
+    test_stochastic_player_count_reset()
     test_hand_history_memory()
     test_history_resets_each_round()
     test_api_compliance()

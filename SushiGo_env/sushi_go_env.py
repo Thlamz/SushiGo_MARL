@@ -112,32 +112,48 @@ class SushiGoParallelEnv(ParallelEnv):
 
     def __init__(
         self,
-        n_players: int = 3,
+        n_players: int | None = 3,
+        min_n_players: int | None = None,
+        max_n_players: int | None = None,
         history_len: int | None = None,
         include_opponent_tableaus: bool = True,
         reward_scale: float = 1.0,
         render_mode=None,
     ):
-        assert 2 <= n_players <= MAX_PLAYERS, "n_players must be in [2, 4]"
+        if n_players is not None and (min_n_players is not None or max_n_players is not None):
+            raise ValueError("Use either n_players or min_n_players/max_n_players, not both.")
+        if n_players is not None:
+            min_n_players = max_n_players = n_players
+        if min_n_players is None:
+            min_n_players = 3
+        if max_n_players is None:
+            max_n_players = min_n_players
+        assert 2 <= min_n_players <= max_n_players <= MAX_PLAYERS, (
+            "player count bounds must satisfy 2 <= min_n_players <= max_n_players <= 4"
+        )
         super().__init__()
 
-        self.n_players = n_players
-        self.hand_size = hand_size_for(n_players)
+        self.min_n_players = min_n_players
+        self.max_n_players = max_n_players
+        self.n_players = max_n_players
+        self.active_n_players = max_n_players
+        self.hand_size = hand_size_for(self.active_n_players)
         # One lap of the table = n_players hands; the n_players-1 *previous* hands
         # span exactly up to the point where the info becomes fully outdated.
-        self.history_len = (n_players - 1) if history_len is None else history_len
+        self.history_len = (max_n_players - 1) if history_len is None else history_len
         assert self.history_len >= 0
         self.include_opponent_tableaus = include_opponent_tableaus
         self.reward_scale = reward_scale
         self.render_mode = render_mode
-        self.last_rewards = [0.0 for _ in range(n_players)]
+        self.last_rewards = np.zeros(self.max_n_players, dtype=np.float64)
         self.cards_discarted = np.zeros(N_TYPES, dtype=np.int64)
+        self.player_mask = np.ones(self.max_n_players, dtype=bool)
 
-        self.possible_agents = [f"player_{i}" for i in range(n_players)]
+        self.possible_agents = [f"player_{i}" for i in range(max_n_players)]
         self.agents = list(self.possible_agents)
 
         # observation layout (named slices into the flat vector) 
-        n_opp = (n_players - 1) if include_opponent_tableaus else 0
+        n_opp = (max_n_players - 1) if include_opponent_tableaus else 0
         sizes = [
             ("current_hand", N_TYPES),                       
             ("hand_history", self.history_len * N_TYPES),    
@@ -162,6 +178,7 @@ class SushiGoParallelEnv(ParallelEnv):
         return DictSpace({
             "observation": Box(low=-1.0, high=50.0, shape=(self.obs_dim,), dtype=np.float32),
             "action_mask": Box(low=0, high=1, shape=(N_TYPES,), dtype=np.int8),
+            "player_mask": Box(low=0, high=1, shape=(), dtype=bool),
         })
 
     @functools.lru_cache(maxsize=None)
@@ -174,17 +191,21 @@ class SushiGoParallelEnv(ParallelEnv):
             self.rng = np.random.default_rng(seed)
 
         self.agents = list(self.possible_agents)
+        self.active_n_players = int(self.rng.integers(self.min_n_players, self.max_n_players + 1))
+        self.n_players = self.active_n_players
+        self.hand_size = hand_size_for(self.active_n_players)
+        self.player_mask = np.arange(self.max_n_players) < self.active_n_players
 
         deck = []
         for card, count in DECK_COMPOSITION.items():
             deck += [card] * count
         self.deck = [int(x) for x in self.rng.permutation(deck)]
 
-        self.pudding_total = np.zeros(self.n_players, dtype=np.int64)
+        self.pudding_total = np.zeros(self.max_n_players, dtype=np.int64)
         self.round_idx = 1
         self.turn = 0
-        self.last_rewards = [0.0 for _ in range(self.n_players)]
-        self.cards_played = np.zeros(N_TYPES, dtype=np.int64)
+        self.last_rewards = np.zeros(self.max_n_players, dtype=np.float64)
+        self.cards_discarted = np.zeros(N_TYPES, dtype=np.int64)
         self._deal_round()  # deals hands; clears tableaus and hand-history memory
 
         observations = {a: self._obs_for(i) for i, a in enumerate(self.agents)}
@@ -196,10 +217,10 @@ class SushiGoParallelEnv(ParallelEnv):
 
         # Snapshot each hand AS SEEN this turn (before anyone drafts) — this is what
         # players will remember in their hand_history.
-        snapshots = [self._hand_counts(p) for p in range(self.n_players)]
+        snapshots = [self._hand_counts(p) for p in range(self.active_n_players)]
 
         # Each player drafts one card of the chosen type.
-        for p, agent in enumerate(acting):
+        for p, agent in enumerate(acting[:self.active_n_players]):
             a = int(actions[agent])
             hand = self.hands[p]
             if a not in hand:  # graceful fallback for invalid (unmasked) actions
@@ -216,7 +237,7 @@ class SushiGoParallelEnv(ParallelEnv):
         round_over = len(self.hands[0]) == 0
         current_scores = self._score_turn()
         turn_scores = current_scores - self.last_rewards        
-        for p, agent in enumerate(acting):
+        for p, agent in enumerate(acting[:self.active_n_players]):
                 rewards[agent] += float(turn_scores[p])
                 infos[agent]["turn_score"] = float(turn_scores[p])
         self.last_rewards = current_scores
@@ -224,18 +245,20 @@ class SushiGoParallelEnv(ParallelEnv):
         if not round_over:
             # Each player files away the hand it just saw, then hands pass one seat
             # along: new_hands[i] = old_hands[i-1].
-            for p in range(self.n_players):
+            for p in range(self.active_n_players):
                 self.seen_history[p].insert(0, snapshots[p])
                 del self.seen_history[p][self.history_len:]
-            self.hands = [self.hands[(i - 1) % self.n_players]
-                          for i in range(self.n_players)]
+            self.hands[:self.active_n_players] = [
+                self.hands[(i - 1) % self.active_n_players]
+                for i in range(self.active_n_players)
+            ]
         else:            
             if self.round_idx < N_ROUNDS:
                 self.round_idx += 1
                 self._deal_round()  # clears tableaus + hand-history, deals new hands
             else:
                 pud_scores = self._score_pudding()  # pudding scored once, at game end
-                for p, agent in enumerate(acting):
+                for p, agent in enumerate(acting[:self.active_n_players]):
                     rewards[agent] += float(pud_scores[p])
                     infos[agent]["pudding_score"] = float(pud_scores[p])
                 terminations = {a: True for a in acting}
@@ -250,20 +273,20 @@ class SushiGoParallelEnv(ParallelEnv):
     # dealing & card placement 
     def _deal_round(self):
         """Clear per-round state (tableaus + hand-history) and deal fresh hands."""
-        self.tableau = [np.zeros(N_TYPES, dtype=np.int64) for _ in range(self.n_players)]
+        self.tableau = [np.zeros(N_TYPES, dtype=np.int64) for _ in range(self.max_n_players)]
         self.nigiri_on_wasabi = [np.zeros(N_TYPES, dtype=np.int64)
-                                 for _ in range(self.n_players)]
-        self.wasabi_unused = [0 for _ in range(self.n_players)]
-        self.seen_history = [[] for _ in range(self.n_players)]  # hand memory resets
-        self.last_rewards = [0.0 for _ in range(self.n_players)]
+                                 for _ in range(self.max_n_players)]
+        self.wasabi_unused = [0 for _ in range(self.max_n_players)]
+        self.seen_history = [[] for _ in range(self.max_n_players)]  # hand memory resets
+        self.last_rewards = np.zeros(self.max_n_players, dtype=np.float64)
         self.hands = [
-            [self.deck.pop() for _ in range(self.hand_size)]
-            for _ in range(self.n_players)
+            [self.deck.pop() for _ in range(self.hand_size)] if p < self.active_n_players else []
+            for p in range(self.max_n_players)
         ]
 
     def _place_card(self, p, card):
         """Add a drafted card to player p's tableau, handling pudding and wasabi."""
-        self.cards_played[card] += 1
+        self.cards_discarted[card] += 1
         if card == PUDDING:
             self.pudding_total[p] += 1
         elif card in NIGIRI_VALUE:
@@ -286,8 +309,8 @@ class SushiGoParallelEnv(ParallelEnv):
     # scoring 
     def _score_turn(self):
         """Score tempura / sashimi / dumpling / nigiri+wasabi / maki for the round."""
-        n = self.n_players
-        scores = np.zeros(n, dtype=np.float64)
+        n = self.active_n_players
+        scores = np.zeros(self.max_n_players, dtype=np.float64)
         for p in range(n):
             t = self.tableau[p]
             scores[p] += (t[TEMPURA] // 2) * 5            # 2 tempura -> 5
@@ -301,8 +324,12 @@ class SushiGoParallelEnv(ParallelEnv):
             sum(self.tableau[p][m] * icons for m, icons in MAKI_ICONS.items())
             for p in range(n)
         ])
-        scores += self._score_maki(maki_counts)
+        scores[:n] += self._score_maki(maki_counts)
         return scores
+
+    def _score_round(self):
+        """Backward-compatible alias for tests/scripts using the old name."""
+        return self._score_turn()
 
     @staticmethod
     def _score_maki(counts):
@@ -326,9 +353,9 @@ class SushiGoParallelEnv(ParallelEnv):
 
     def _score_pudding(self):
         """End-of-game pudding: most -> +6, least -> -6 (no penalty in a 2-player game)."""
-        n = self.n_players
-        out = np.zeros(n, dtype=np.float64)
-        pud = self.pudding_total
+        n = self.active_n_players
+        out = np.zeros(self.max_n_players, dtype=np.float64)
+        pud = self.pudding_total[:n]
         most = [i for i in range(n) if pud[i] == pud.max()]
         for i in most:
             out[i] += 6 // len(most)
@@ -348,6 +375,12 @@ class SushiGoParallelEnv(ParallelEnv):
 
     def _obs_for(self, p):
         """Ego-centric observation for player p."""
+        if p >= self.active_n_players:
+            obs = np.full(self.obs_dim, -1.0, dtype=np.float32)
+            mask = np.zeros(N_TYPES, dtype=np.int8)
+            mask[0] = 1
+            return {"observation": obs, "action_mask": mask, "player_mask": np.bool_(False)}
+
         parts = [self._hand_counts(p)]  # 1. current hand
 
         # 2. hand history: last `history_len` hands seen, most-recent-first, padded.
@@ -360,8 +393,11 @@ class SushiGoParallelEnv(ParallelEnv):
 
         # 4. opponents' tableaus, ordered by seat offset (ego-centric)
         if self.include_opponent_tableaus:
-            for off in range(1, self.n_players):
-                parts.append(self._tableau_block((p + off) % self.n_players))
+            for off in range(1, self.max_n_players):
+                if off < self.active_n_players:
+                    parts.append(self._tableau_block((p + off) % self.active_n_players))
+                else:
+                    parts.append(np.zeros(N_TYPES + 2, dtype=np.float32))
 
         # 5. cards_discarted
         DECK_COUNTS = np.array([DECK_COMPOSITION[i] for i in range(N_TYPES)], dtype=np.float32)
@@ -376,7 +412,7 @@ class SushiGoParallelEnv(ParallelEnv):
         obs = np.concatenate(parts).astype(np.float32)
         assert obs.shape[0] == self.obs_dim, (obs.shape[0], self.obs_dim)
         mask = (self._hand_counts(p) > 0).astype(np.int8)
-        return {"observation": obs, "action_mask": mask}
+        return {"observation": obs, "action_mask": mask, "player_mask": np.bool_(True)}
 
     def split_observation(self, obs_vector):
         """Decode a flat observation vector into its named sections (debugging aid)."""
@@ -385,7 +421,7 @@ class SushiGoParallelEnv(ParallelEnv):
     # ---- misc -------------------------------------------------------------------------
     def render(self):
         lines = [f"--- Round {self.round_idx} | turn {self.turn} ---"]
-        for p in range(self.n_players):
+        for p in range(self.active_n_players):
             tab = ", ".join(f"{CARD_NAMES[c]}x{int(self.tableau[p][c])}"
                             for c in range(N_TYPES) if self.tableau[p][c] > 0)
             lines.append(f"  player_{p}: [{tab}]  pudding={self.pudding_total[p]}")
