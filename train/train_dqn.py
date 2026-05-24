@@ -189,6 +189,9 @@ def train(args):
     # Q-network. In stochastic mode this is sized for max_n_players; inactive
     # slots are still forwarded, but their losses are masked out below.
     qvalue_actor = build_qvalue_actor(env, model_n_players, obs_dim, args, device=device)
+    if args.compile:
+        print("compiling Q-network with torch.compile()...")  # speeds up training but adds overhead, so optional
+        qvalue_actor = torch.compile(qvalue_actor)
     qvalue_actor(env.reset())  # warm up lazy parameters with a real observation
     # It must happen before you build the optimizer or the loss, because those need real parameters to attach to.
 
@@ -311,6 +314,7 @@ def get_args():
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--reward-scale", type=float, default=0.1)
     p.add_argument("--cuda", action="store_true")
+    p.add_argument("--compile", action="store_true", help="torch.compile the Q-network for faster training")
     p.add_argument("--smoke", action="store_true", help="tiny wiring-check run")
     p.add_argument("--use-encoder", action="store_true", help="use transformer encoder before the DQN Q-head")
     p.add_argument("--mlp-cells", type=int, default=128)
