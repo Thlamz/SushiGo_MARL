@@ -34,9 +34,12 @@ loss/reward and bias learning.
 """
 import argparse
 import warnings
+from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 from torch import nn
+from torch.profiler import ProfilerActivity, profile, record_function, schedule, tensorboard_trace_handler
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.collectors import SyncDataCollector, MultiSyncDataCollector
 from torchrl.data import TensorDictReplayBuffer
@@ -65,6 +68,63 @@ ACTION_VALUE_KEY = (GROUP, "action_value")          # the 12 Q-values
 CHOSEN_VALUE_KEY = (GROUP, "chosen_action_value")   # Q of the action actually taken
 
 NUM_WORKERS = 4 
+
+
+@contextmanager
+def maybe_profiler(args, device):
+    """Optionally wrap training in torch.profiler with TensorBoard trace export."""
+    if not args.profile:
+        yield None
+        return
+
+    activities = [ProfilerActivity.CPU]
+    if device == "cuda":
+        activities.append(ProfilerActivity.CUDA)
+
+    sort_by = args.profile_sort or ("self_cuda_time_total" if device == "cuda" else "self_cpu_time_total")
+
+    print(
+        "profiling enabled: "
+        f"wait={args.profile_wait} warmup={args.profile_warmup} "
+        f"active={args.profile_active} repeat={args.profile_repeat}"
+    )
+    on_trace_ready = None
+    if args.profile_export_trace:
+        trace_dir = Path(args.profile_dir)
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        on_trace_ready = tensorboard_trace_handler(str(trace_dir))
+        print(f"exporting TensorBoard traces to: {trace_dir}")
+        print(f"view traces with: tensorboard --logdir {trace_dir}")
+    else:
+        print("TensorBoard trace export disabled; use --profile-export-trace to write trace files.")
+
+    prof_schedule = schedule(
+        wait=args.profile_wait,
+        warmup=args.profile_warmup,
+        active=args.profile_active,
+        repeat=args.profile_repeat,
+        skip_first=args.profile_skip_first,
+    )
+    with profile(
+        activities=activities,
+        schedule=prof_schedule,
+        on_trace_ready=on_trace_ready,
+        record_shapes=args.profile_shapes,
+        profile_memory=args.profile_memory,
+        with_stack=args.profile_stack,
+    ) as prof:
+        yield prof
+
+    print(prof.key_averages().table(sort_by=sort_by, row_limit=args.profile_row_limit))
+
+
+def profile_stop_steps(args):
+    """Number of training-loop iterations needed to finish the profiler schedule."""
+    if not args.profile or args.profile_repeat == 0:
+        return None
+    return args.profile_skip_first + args.profile_repeat * (
+        args.profile_wait + args.profile_warmup + args.profile_active
+    )
 
 
 def build_qvalue_selector():
@@ -173,7 +233,10 @@ def train(args):
         else f"n_players=[{min_n_players}, {max_n_players}]"
     )
     model_msg = "encoder+DQN" if args.use_encoder else "MLP+DQN"
-    print(f"device={device}  {player_msg}  model={model_msg}  total_frames={total_frames}")
+    print(
+        f"device={device}  {player_msg}  model={model_msg}  "
+        f"workers={args.num_workers}  total_frames={total_frames}"
+    )
 
     # environment  
     env = make_torchrl_env(
@@ -242,57 +305,93 @@ def train(args):
             device=device,
         )
 
-    collector = MultiSyncDataCollector(
-        create_env_fn=[env_factory] * NUM_WORKERS,
-        policy=collector_policy,
-        frames_per_batch=args.frames_per_batch,   # split across workers automatically
-        total_frames=total_frames,
-        device=device,
-        storing_device="cpu",
-    )
+    if args.num_workers == 1:
+        collector = SyncDataCollector(
+            create_env_fn=env_factory,
+            policy=collector_policy,
+            frames_per_batch=args.frames_per_batch,
+            total_frames=total_frames,
+            device=device,
+            storing_device="cpu",
+        )
+    else:
+        collector = MultiSyncDataCollector(
+            create_env_fn=[env_factory] * args.num_workers,
+            policy=collector_policy,
+            frames_per_batch=args.frames_per_batch,   # split across workers automatically
+            total_frames=total_frames,
+            device=device,
+            storing_device="cpu",
+        )
     replay = TensorDictReplayBuffer(
         storage=LazyTensorStorage(args.buffer_size, device=device),
         batch_size=args.batch_size,
     )
 
     # training loop
-    for it, batch in enumerate(collector):
-        replay.extend(batch.reshape(-1))  # flatten time dim; agent dim stays nested
+    collector_iter = iter(collector)
+    profile_steps = profile_stop_steps(args)
+    with maybe_profiler(args, device) as prof:
+        for it in range(args.iterations):
+            with record_function("train/collect_batch"):
+                try:
+                    batch = next(collector_iter)
+                except StopIteration:
+                    break
 
-        last_loss = None
-        for _ in range(args.updates_per_batch):
-            sample = replay.sample()
-            loss_vals = loss_module(sample)
-            # The sampled action/reward belong to the current observation, so use
-            # the current player_mask, not next.player_mask, for loss reduction.
-            active = sample.get(PLAYER_MASK_KEY).squeeze(-1).bool()
-            loss = masked_mean(loss_vals["loss"], active)
-            loss.backward()
-            nn.utils.clip_grad_norm_(loss_module.parameters(), args.max_grad_norm) # caps the gradient magnitude so a rare huge TD error can't blow up the weights
-            optim.step()
-            optim.zero_grad()
-            target_updater.step()        # slow target-network update
-            last_loss = loss.item()
+            with record_function("train/replay_extend"):
+                replay.extend(batch.reshape(-1))  # flatten time dim; agent dim stays nested
 
-        explore.step(args.frames_per_batch)   # anneal epsilon
-        collector.update_policy_weights_()
+            last_loss = None
+            for _ in range(args.updates_per_batch):
+                with record_function("train/update"):
+                    with record_function("train/replay_sample"):
+                        sample = replay.sample()
+                    with record_function("train/loss_forward"):
+                        loss_vals = loss_module(sample)
+                        # The sampled action/reward belong to the current observation, so use
+                        # the current player_mask, not next.player_mask, for loss reduction.
+                        active = sample.get(PLAYER_MASK_KEY).squeeze(-1).bool()
+                        loss = masked_mean(loss_vals["loss"], active)
+                    with record_function("train/backward"):
+                        loss.backward()
+                    with record_function("train/clip_grad"):
+                        nn.utils.clip_grad_norm_(loss_module.parameters(), args.max_grad_norm) # caps the gradient magnitude so a rare huge TD error can't blow up the weights
+                    with record_function("train/optim_step"):
+                        optim.step()
+                    with record_function("train/optim_zero_grad"):
+                        optim.zero_grad()
+                    with record_function("train/target_update"):
+                        target_updater.step()        # slow target-network update
+                    last_loss = loss.item()
 
-        # Logging uses next.player_mask because these rewards/episode returns live
-        # under "next". This prevents inactive padded seats from diluting metrics.
-        active_next = batch.get(("next", *PLAYER_MASK_KEY)).squeeze(-1).bool()
-        reward = batch.get(("next", GROUP, "reward")).squeeze(-1)
-        mean_r = reward[active_next].mean().item()
-        done = batch.get(("next", GROUP, "done")).squeeze(-1).bool()
-        ep_ret = batch.get(("next", GROUP, "episode_reward")).squeeze(-1)
-        finished = ep_ret[done & active_next]
-        eps_now = explore.eps.item() if hasattr(explore.eps, "item") else float(explore.eps)
-        msg = (f"iter {it:3d} | loss={last_loss:.4f} | eps={eps_now:.3f} "
-               f"| mean turn reward={mean_r:+.3f}")
-        if finished.numel() > 0:
-            msg += f" | mean episode return/seat={finished.float().mean().item():+.2f}"
-        print(msg)
+            with record_function("train/post_update_policy"):
+                explore.step(args.frames_per_batch)   # anneal epsilon
+                collector.update_policy_weights_()
 
-    if not args.smoke:
+            with record_function("train/log_metrics"):
+                # Logging uses next.player_mask because these rewards/episode returns live
+                # under "next". This prevents inactive padded seats from diluting metrics.
+                active_next = batch.get(("next", *PLAYER_MASK_KEY)).squeeze(-1).bool()
+                reward = batch.get(("next", GROUP, "reward")).squeeze(-1)
+                mean_r = reward[active_next].mean().item()
+                done = batch.get(("next", GROUP, "done")).squeeze(-1).bool()
+                ep_ret = batch.get(("next", GROUP, "episode_reward")).squeeze(-1)
+                finished = ep_ret[done & active_next]
+                eps_now = explore.eps.item() if hasattr(explore.eps, "item") else float(explore.eps)
+                msg = (f"iter {it:3d} | loss={last_loss:.4f} | eps={eps_now:.3f} "
+                       f"| mean turn reward={mean_r:+.3f}")
+                if finished.numel() > 0:
+                    msg += f" | mean episode return/seat={finished.float().mean().item():+.2f}"
+                print(msg)
+
+            if prof is not None:
+                prof.step()
+                if profile_steps is not None and it + 1 >= profile_steps:
+                    print(f"profiler schedule completed after {it + 1} iterations; stopping training loop.")
+                    break
+
+    if not args.smoke and not args.profile:
         torch.save(qvalue_actor.state_dict(), args.save_path)
         print(f"saved Q-network -> {args.save_path}")
     collector.shutdown()
@@ -313,17 +412,34 @@ def get_args():
     p.add_argument("--target-eps", type=float, default=0.995)  # SoftUpdate mix factor
     p.add_argument("--max-grad-norm", type=float, default=10.0)
     p.add_argument("--reward-scale", type=float, default=0.1)
+    p.add_argument("--num-workers", type=int, default=NUM_WORKERS, help="environment collectors; use 1 for single-process profiling")
     p.add_argument("--cuda", action="store_true")
     p.add_argument("--compile", action="store_true", help="torch.compile the Q-network for faster training")
     p.add_argument("--smoke", action="store_true", help="tiny wiring-check run")
     p.add_argument("--use-encoder", action="store_true", help="use transformer encoder before the DQN Q-head")
+    p.add_argument("--profile", action="store_true", help="run torch.profiler around the training loop")
+    p.add_argument("--profile-dir", type=str, default="runs/profiler/dqn", help="TensorBoard trace output directory")
+    p.add_argument("--profile-export-trace", action="store_true", help="write TensorBoard/Chrome trace files; can be very large")
+    p.add_argument("--profile-skip-first", type=int, default=0, help="profiler steps to skip before scheduling")
+    p.add_argument("--profile-wait", type=int, default=1, help="profiler schedule wait steps")
+    p.add_argument("--profile-warmup", type=int, default=1, help="profiler schedule warmup steps")
+    p.add_argument("--profile-active", type=int, default=3, help="profiler schedule active steps")
+    p.add_argument("--profile-repeat", type=int, default=1, help="profiler schedule repeats")
+    p.add_argument("--profile-shapes", action="store_true", help="record tensor shapes in profiler events")
+    p.add_argument("--profile-memory", action="store_true", help="record tensor memory usage in profiler events")
+    p.add_argument("--profile-stack", action="store_true", help="record Python stacks; useful but expensive")
+    p.add_argument("--profile-sort", type=str, default=None, help="sort column for the printed profiler summary")
+    p.add_argument("--profile-row-limit", type=int, default=25, help="number of rows in the printed profiler summary")
     p.add_argument("--mlp-cells", type=int, default=128)
     p.add_argument("--mlp-depth", type=int, default=2)
     p.add_argument("--encoder-output-dim", type=int, default=128)
     p.add_argument("--encoder-q-cells", type=int, default=128)
     p.add_argument("--encoder-q-depth", type=int, default=1)
     p.add_argument("--save-path", type=str, default="sushi_go_qnet_2_players.pt")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.num_workers < 1:
+        p.error("--num-workers must be >= 1")
+    return args
 
 
 if __name__ == "__main__":
