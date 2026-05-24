@@ -7,7 +7,7 @@ from torchrl.envs import RewardSum, TransformedEnv, check_env_specs
 from torchrl.envs.libs.pettingzoo import PettingZooWrapper
 from torchrl.modules import MaskedCategorical, MultiAgentMLP, ProbabilisticActor, ValueOperator
 
-from sushi_go_env import SushiGoParallelEnv, N_TYPES
+from SushiGo_env.sushi_go_env import SushiGoParallelEnv, N_TYPES
 
 # Grouped tensordict keys produced by the PettingZoo wrapper. The env's Dict
 # observation nests its "observation" entry, hence the doubled key below.

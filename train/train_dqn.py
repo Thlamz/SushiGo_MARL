@@ -131,7 +131,7 @@ def train(args):
     # data collection + replay buffer
     def env_factory():
         return make_torchrl_env(
-            n_players=args.n_players, reward_scale=args.reward_scale, device="cpu")
+            n_players=args.n_players, reward_scale=args.reward_scale, device=device)
 
     collector = MultiSyncDataCollector(
         create_env_fn=[env_factory] * NUM_WORKERS,
