@@ -110,6 +110,17 @@ def build_qvalue_actor(env, n_players, obs_dim, args, device="cpu"):
             n_agents=n_players,
             qvalue_module=build_qvalue_selector(),
             encoder_output_dim=args.encoder_output_dim,
+            sequential_embed_dim=args.encoder_sequential_embed_dim,
+            sequential_head_dim=args.encoder_sequential_head_dim,
+            sequential_num_heads=args.encoder_sequential_num_heads,
+            sequential_ff_dim=args.encoder_sequential_ff_dim,
+            sequential_depth=args.encoder_sequential_depth,
+            sequential_dropout=args.encoder_sequential_dropout,
+            flat_embed_dim=args.encoder_flat_embed_dim,
+            flat_depth=args.encoder_flat_depth,
+            flat_num_cells=args.encoder_flat_cells,
+            mix_layer_depth=args.encoder_mix_depth,
+            mix_layer_num_cells=args.encoder_mix_cells,
             q_head_cells=args.encoder_q_cells,
             q_head_depth=args.encoder_q_depth,
             device=device,
@@ -320,6 +331,17 @@ def get_args():
     p.add_argument("--mlp-cells", type=int, default=128)
     p.add_argument("--mlp-depth", type=int, default=2)
     p.add_argument("--encoder-output-dim", type=int, default=128)
+    p.add_argument("--encoder-sequential-embed-dim", type=int, default=64)
+    p.add_argument("--encoder-sequential-head-dim", type=int, default=16)
+    p.add_argument("--encoder-sequential-num-heads", type=int, default=4)
+    p.add_argument("--encoder-sequential-ff-dim", type=int, default=128)
+    p.add_argument("--encoder-sequential-depth", type=int, default=2)
+    p.add_argument("--encoder-sequential-dropout", type=float, default=0.0)
+    p.add_argument("--encoder-flat-embed-dim", type=int, default=64)
+    p.add_argument("--encoder-flat-depth", type=int, default=1)
+    p.add_argument("--encoder-flat-cells", type=int, default=128)
+    p.add_argument("--encoder-mix-depth", type=int, default=1)
+    p.add_argument("--encoder-mix-cells", type=int, default=128)
     p.add_argument("--encoder-q-cells", type=int, default=128)
     p.add_argument("--encoder-q-depth", type=int, default=1)
     p.add_argument("--save-path", type=str, default="sushi_go_qnet_2_players.pt")
