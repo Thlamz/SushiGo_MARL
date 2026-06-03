@@ -33,6 +33,7 @@ loss/reward and bias learning.
 
 """
 import argparse
+import json
 import warnings
 
 import torch
@@ -169,7 +170,6 @@ def masked_mean(value, mask):
     return (value * mask).sum() / mask.sum().clamp_min(1.0)
 
 
-
 def train(args):
     device = "cuda" if (args.cuda and torch.cuda.is_available()) else "cpu"
     n_players, min_n_players, max_n_players, model_n_players = resolve_player_config(args)
@@ -185,6 +185,7 @@ def train(args):
     )
     model_msg = "encoder+DQN" if args.use_encoder else "MLP+DQN"
     print(f"device={device}  {player_msg}  model={model_msg}  total_frames={total_frames}")
+    print(f"cli_args={json.dumps(vars(args), sort_keys=True)}")
 
     # environment  
     env = make_torchrl_env(
