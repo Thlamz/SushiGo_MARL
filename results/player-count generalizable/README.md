@@ -19,20 +19,3 @@ Our approach combines three ideas:
 3. **Optional encoder architecture**
 
    The encoder-based model is included as a stronger architectural option for learning compact representations from the padded/sequential observations. The encoder can help the policy separate meaningful player-state information from padding and support better generalization across variable numbers of agents.
-
-## Result Files
-
-- `qnet_results.txt`: results for the baseline Q-network approach.
-- `encoder_results.txt`: results for the encoder-based architecture.
-
-## Evaluation Focus
-
-The main question for this experiment track is whether a single trained model can remain competitive across multiple player counts. Results should be compared not only by average performance, but also by how stable the model is across 2-, 3-, and 4-player settings.
-
-Useful signals include:
-
-- win rate or ranking across each player count;
-- score consistency across table sizes;
-- degradation when moving away from the most common training configuration;
-- comparison between the baseline Q-network and encoder-based model.
-
