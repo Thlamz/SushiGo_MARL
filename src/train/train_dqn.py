@@ -35,6 +35,8 @@ loss/reward and bias learning.
 import argparse
 import json
 import warnings
+import sys 
+import os
 
 import torch
 from torch import nn
@@ -46,6 +48,8 @@ from torchrl.envs import check_env_specs
 from torchrl.modules import EGreedyModule, MultiAgentMLP, QValueModule
 from torchrl.objectives import DQNLoss, SoftUpdate, ValueEstimators
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../SushiGo_env')))
 from SushiGo_env.sushi_go_env import N_TYPES
 from SushiGo_env.encoder_adapter import build_encoder_qvalue_actor
 from SushiGo_env.torchrl_integration import (

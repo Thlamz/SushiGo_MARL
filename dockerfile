@@ -21,13 +21,15 @@ RUN apt-get install -y python3-pip
 RUN pip install pytest
 RUN pip install numpy && pip install matplotlib && pip install scipy
 RUN pip install torch
+RUN pip install torchrl
+RUN pip install tensordict
 RUN pip install pettingzoo
 RUN pip install gradysim
 RUN pip install flask
 
-RUN mkdir -p /MARL/src
+RUN mkdir -p /SushiGo
 
-WORKDIR /MARL
+WORKDIR /SushiGo
 
 
     

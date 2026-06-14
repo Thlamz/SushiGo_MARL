@@ -7,23 +7,30 @@ every player's tableau is laid out on the board, scores update each turn.
 
 USAGE
 =====
-    python -m  test.play.py --model models/DQN/sushi_go_qnet_3_players.pt --n-players 3
+    python3 test/play.py --model models/DQN/sushi_go_qnet_3_players.pt --n-players 3
 
   --n-players MUST match the player count the model was trained on (the observation
   size depends on it). Default 3, which matches train_madqn.py's default.
   If the model file is missing or fails to load, the app falls back to RANDOM
   opponents and says so in the UI, so you can still play / test the interface.
 
-This reuses build_qvalue_actor (train_madqn.py) and the grouped tensordict keys
+This reuses build_qvalue_actor (train_dqn.py) and the grouped tensordict keys
 (torchrl_integration.py), so model loading is guaranteed consistent with training.
+
+Change this to import to your own trained model
 """
 import argparse
 import sys
 
 import numpy as np
 from flask import Flask, jsonify, request, Response
+import os
 
-from SushuGo_env.sushi_go_env import SushiGoParallelEnv, N_TYPES
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# ADD THIS LINE: Expose the inside of SushiGo_env to PyTorch's unpickler
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../SushiGo_env')))
+
+from SushiGo_env.sushi_go_env import SushiGoParallelEnv, N_TYPES
 
 HUMAN_SEAT = 0
 
@@ -52,7 +59,7 @@ def load_model(n_players, obs_dim, path):
     try:
         import torch
         from tensordict import TensorDict
-        from train import build_qvalue_actor
+        from train.train_dqn import build_qvalue_actor
         from torchrl_integration import OBS_KEY, MASK_KEY
 
         actor = build_qvalue_actor(n_players, obs_dim, device="cpu")

@@ -2,9 +2,9 @@ version: '3.8'
 
 services:
   vision_dev:
-    image: marl:latest
-    container_name: marl_container
-    hostname: marl_container
+    image: sushi_go:latest
+    container_name: sushi_go_container
+    hostname: sushi_go_container
     runtime: nvidia
     environment:
       - QT_X11_NO_MITSHM=1
@@ -15,7 +15,7 @@ services:
       - /dev/dri  # for GPU access
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
-      - ./src:/MARL/src:rw  # Mount the current directory as readable and writable
+      - ./src:/SushiGo:rw  # Mount the current directory as readable and writable
 
     deploy:
       resources:
